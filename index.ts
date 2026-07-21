@@ -3,7 +3,7 @@
  *
  * /marker → set checkpoint
  * /branch → jump to fresh context from marker (sub-branch)
- * /end    → pick summary style interactively, compress back to marker
+ * /end    → pick/create/delete summary prompts, compress back to marker
  *
  * Same-branch flow: /marker → work → /end
  * Branch flow:      /marker → /branch → work → /end
@@ -24,6 +24,10 @@ import type {
 	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+
 // ── Constants ─────────────────────────────────────────────────────
 
 const STATE_ENTRY = "tree-workflow-state";
@@ -31,51 +35,19 @@ const MARKER_LABEL = "marker";
 const END_WIDGET = "tree-workflow-end";
 const STATUS_KEY = "tree-workflow";
 
-const END_PROMPTS = [
-	{
-		label: "默认压缩",
-		prompt: [
-			"Treat this as a finished work increment that should become durable context for continuing the same repository session.",
-			"Focus on the final accepted outcome, not dead ends or step-by-step implementation noise.",
-			"Capture the concrete code or repo changes, key decisions, important constraints, and any follow-up that still matters.",
-			"Mention relevant files, commands, commits, PR outcomes, or review feedback only when they change future work.",
-			"Omit temporary debugging details, abandoned attempts, and incidental churn that no longer matters.",
-			"Write the summary so a future agent can continue from the repo familiarization and planning context plus this completed increment.",
-		].join("\n"),
-	},
-	{
-		label: "仅结论",
-		prompt: [
-			"This summary should capture ONLY the final outcome — what changed, what was decided.",
-			"Omit all intermediate steps, attempts, debugging, discussion, and reasoning.",
-			"Format: one paragraph of final result.",
-		].join("\n"),
-	},
-	{
-		label: "详细记录",
-		prompt: [
-			"Write a thorough summary that preserves enough detail for someone who needs to retrace this work.",
-			"Include implementation steps, notable intermediate states, rejected approaches and why they failed, and final decisions with rationale.",
-			"Still omit truly irrelevant churn (typos, trivial build fixes), but keep technical exploration steps.",
-		].join("\n"),
-	},
-	{
-		label: "代码变更",
-		prompt: [
-			"Focus this summary on concrete code changes: files modified, APIs added/changed/removed, new types, test coverage, and migration notes.",
-			"Omit discussion, reasoning, dead ends, and non-code decisions.",
-			"List changed files with a brief description of each change.",
-		].join("\n"),
-	},
-	{
-		label: "决策记录",
-		prompt: [
-			"Focus this summary on architecture decisions, technology choices, tradeoffs considered, and constraints discovered.",
-			"Capture each decision with: context, options considered, chosen approach, and rationale.",
-			"Omit implementation steps, code details, and debugging history.",
-		].join("\n"),
-	},
-];
+const PROMPTS_FILE = join(homedir(), ".pi", "agent", "tree-workflow-prompts.json");
+
+const DEFAULT_PROMPT = [
+	"Treat this as a finished work increment that should become durable context for continuing the same repository session.",
+	"Focus on the final accepted outcome, not dead ends or step-by-step implementation noise.",
+	"Capture the concrete code or repo changes, key decisions, important constraints, and any follow-up that still matters.",
+	"Mention relevant files, commands, commits, PR outcomes, or review feedback only when they change future work.",
+	"Omit temporary debugging details, abandoned attempts, and incidental churn that no longer matters.",
+	"Write the summary so a future agent can continue from the repo familiarization and planning context plus this completed increment.",
+].join("\n");
+
+const ACTION_CREATE = "＋ 创建新的prompt";
+const ACTION_DELETE = "－ 删除已有的prompt";
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -83,6 +55,10 @@ interface WorkflowState {
 	version: 1;
 	markerId: string;
 	branched?: boolean;
+}
+
+interface PromptsStore {
+	custom: Record<string, string>;
 }
 
 // ── State (supergsd-style: on-demand from branch) ────────────────
@@ -93,7 +69,6 @@ function isState(value: unknown): value is WorkflowState {
 	return c.version === 1 && typeof c.markerId === "string";
 }
 
-/** Scan branch leaf→root for the latest state entry. */
 function readState(ctx: ExtensionContext): WorkflowState | undefined {
 	let state: WorkflowState | undefined;
 	for (const entry of ctx.sessionManager.getBranch()) {
@@ -103,7 +78,6 @@ function readState(ctx: ExtensionContext): WorkflowState | undefined {
 	return state;
 }
 
-/** Walk up from current leaf to find the first semantic (non-custom, non-label) entry. */
 function getSemanticLeafId(ctx: ExtensionContext): string | undefined {
 	let id = ctx.sessionManager.getLeafId();
 	while (id) {
@@ -148,7 +122,7 @@ function findFreshTargetId(session: SessionLike): string | null {
 	return branch[0].parentId ?? branch[0].id;
 }
 
-// ── Status (reads state on-demand) ──────────────────────────────
+// ── Status ──────────────────────────────────────────────────────
 
 function updateStatus(ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
@@ -171,7 +145,7 @@ function updateStatus(ctx: ExtensionContext): void {
 	}
 }
 
-// ── Label + state writer (shared by /marker and /end) ───────────
+// ── Label + state writer ───────────────────────────────────────
 
 function applyMarker(
 	pi: ExtensionAPI,
@@ -208,36 +182,91 @@ function applyMarker(
 	updateStatus(ctx);
 }
 
-// ── End prompt selection ─────────────────────────────────────────
+// ── Prompt persistence ─────────────────────────────────────────
 
-/**
- * Resolve summary instructions for /end.
- *
- * - args is non-empty → use as custom instructions
- * - TUI mode → interactive picker
- * - non-TUI → use default prompt
- * Returns null if cancelled (picker dismissed).
- */
+function loadPrompts(): PromptsStore {
+	try {
+		const raw = readFileSync(PROMPTS_FILE, "utf-8");
+		const parsed = JSON.parse(raw);
+		if (parsed && typeof parsed === "object" && parsed.custom) {
+			return parsed as PromptsStore;
+		}
+	} catch {
+		// File doesn't exist or is corrupt — start fresh
+	}
+	return { custom: {} };
+}
+
+function savePrompts(store: PromptsStore): void {
+	const dir = join(homedir(), ".pi", "agent");
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(PROMPTS_FILE, JSON.stringify(store, null, 2), "utf-8");
+}
+
+// ── Interactive /end picker ─────────────────────────────────────
+
 async function resolveEndInstructions(
-	args: string,
 	ctx: ExtensionCommandContext,
 ): Promise<string | null> {
-	const trimmed = args.trim();
-	if (trimmed) return trimmed;
+	if (!ctx.hasUI) return DEFAULT_PROMPT;
 
-	if (!ctx.hasUI) {
-		// Non‑TUI fallback: use default
-		return END_PROMPTS[0].prompt;
+	const store = loadPrompts();
+	const customNames = Object.keys(store.custom);
+
+	while (true) {
+		const items: string[] = ["默认压缩"];
+		if (customNames.length > 0) items.push(...customNames);
+		if (customNames.length > 0) items.push("──────────────");
+		items.push(ACTION_CREATE);
+		if (customNames.length > 0) items.push(ACTION_DELETE);
+
+		const choice = await ctx.ui.select("选择摘要风格:", items);
+		if (!choice) return null; // cancelled
+
+		// ── Built-in ──
+		if (choice === "默认压缩") return DEFAULT_PROMPT;
+
+		// ── User's custom prompt ──
+		if (store.custom[choice]) return store.custom[choice];
+
+		// ── Create ──
+		if (choice === ACTION_CREATE) {
+			const name = await ctx.ui.input("Prompt 名称:", "");
+			if (!name) continue; // cancelled or empty → back to picker
+
+			const content = await ctx.ui.editor(
+				`编写 prompt "${name}":`,
+				"",
+			);
+			if (!content) continue;
+
+			store.custom[name] = content;
+			savePrompts(store);
+			customNames.push(name);
+			ctx.ui.notify(`Prompt "${name}" 已保存`, "info");
+			continue; // back to picker
+		}
+
+		// ── Delete ──
+		if (choice === ACTION_DELETE) {
+			if (customNames.length === 0) {
+				ctx.ui.notify("没有可删除的 prompt", "info");
+				continue;
+			}
+
+			const toDelete = await ctx.ui.select("选择要删除的:", customNames);
+			if (!toDelete) continue;
+
+			const confirmed = await ctx.ui.confirm("确认删除", `删除 "${toDelete}"?`);
+			if (!confirmed) continue;
+
+			delete store.custom[toDelete];
+			savePrompts(store);
+			customNames.splice(customNames.indexOf(toDelete), 1);
+			ctx.ui.notify(`Prompt "${toDelete}" 已删除`, "info");
+			continue; // back to picker
+		}
 	}
-
-	const choice = await ctx.ui.select(
-		"Summary style:",
-		END_PROMPTS.map((p) => p.label),
-	);
-	if (!choice) return null;
-
-	const found = END_PROMPTS.find((p) => p.label === choice);
-	return found?.prompt ?? END_PROMPTS[0].prompt;
 }
 
 // ── Plugin ───────────────────────────────────────────────────────
@@ -304,7 +333,6 @@ export default function (pi: ExtensionAPI) {
 			const result = await ctx.navigateTree(fresh, { summarize: false });
 			if (result.cancelled) return;
 
-			// Write branched state + label at the fresh position
 			pi.appendEntry(STATE_ENTRY, {
 				version: 1,
 				markerId,
@@ -322,7 +350,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("end", {
 		description:
 			"Summarize work since marker and advance the checkpoint",
-		handler: async (args, ctx) => {
+		handler: async (_args, ctx) => {
 			const clearFeedback = () => {
 				if (ctx.hasUI) ctx.ui.setWidget(END_WIDGET, undefined);
 				ctx.ui.setWorkingMessage();
@@ -351,12 +379,8 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Resolve summary instructions
-			const instructions = await resolveEndInstructions(args, ctx);
-			if (instructions === null) {
-				// User cancelled the picker
-				return;
-			}
+			const instructions = await resolveEndInstructions(ctx);
+			if (instructions === null) return;
 
 			ctx.ui.setWorkingMessage(
 				ctx.ui.theme.fg("dim", "Summarizing increment…"),
