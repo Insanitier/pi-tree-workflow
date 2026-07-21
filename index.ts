@@ -46,8 +46,8 @@ const DEFAULT_PROMPT = [
 	"Write the summary so a future agent can continue from the repo familiarization and planning context plus this completed increment.",
 ].join("\n");
 
-const ACTION_CREATE = "＋ 创建新的prompt";
-const ACTION_DELETE = "－ 删除已有的prompt";
+const ACTION_CREATE = "+ Create prompt";
+const ACTION_DELETE = "- Delete prompt";
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -214,28 +214,28 @@ async function resolveEndInstructions(
 	const customNames = Object.keys(store.custom);
 
 	while (true) {
-		const items: string[] = ["默认压缩"];
+		const items: string[] = ["Default"];
 		if (customNames.length > 0) items.push(...customNames);
 		if (customNames.length > 0) items.push("──────────────");
 		items.push(ACTION_CREATE);
 		if (customNames.length > 0) items.push(ACTION_DELETE);
 
-		const choice = await ctx.ui.select("选择摘要风格:", items);
+		const choice = await ctx.ui.select("Summary style:", items);
 		if (!choice) return null; // cancelled
 
 		// ── Built-in ──
-		if (choice === "默认压缩") return DEFAULT_PROMPT;
+		if (choice === "Default") return DEFAULT_PROMPT;
 
 		// ── User's custom prompt ──
 		if (store.custom[choice]) return store.custom[choice];
 
 		// ── Create ──
 		if (choice === ACTION_CREATE) {
-			const name = await ctx.ui.input("Prompt 名称:", "");
+			const name = await ctx.ui.input("Prompt name:", "");
 			if (!name) continue; // cancelled or empty → back to picker
 
 			const content = await ctx.ui.editor(
-				`编写 prompt "${name}":`,
+				`Write prompt "${name}":`,
 				"",
 			);
 			if (!content) continue;
@@ -243,27 +243,27 @@ async function resolveEndInstructions(
 			store.custom[name] = content;
 			savePrompts(store);
 			customNames.push(name);
-			ctx.ui.notify(`Prompt "${name}" 已保存`, "info");
+			ctx.ui.notify(`Prompt "${name}" saved`, "info");
 			continue; // back to picker
 		}
 
 		// ── Delete ──
 		if (choice === ACTION_DELETE) {
 			if (customNames.length === 0) {
-				ctx.ui.notify("没有可删除的 prompt", "info");
+				ctx.ui.notify("No custom prompts to delete", "info");
 				continue;
 			}
 
-			const toDelete = await ctx.ui.select("选择要删除的:", customNames);
+			const toDelete = await ctx.ui.select("Choose prompt to delete:", customNames);
 			if (!toDelete) continue;
 
-			const confirmed = await ctx.ui.confirm("确认删除", `删除 "${toDelete}"?`);
+			const confirmed = await ctx.ui.confirm("Confirm delete", `Delete "${toDelete}"?`);
 			if (!confirmed) continue;
 
 			delete store.custom[toDelete];
 			savePrompts(store);
 			customNames.splice(customNames.indexOf(toDelete), 1);
-			ctx.ui.notify(`Prompt "${toDelete}" 已删除`, "info");
+			ctx.ui.notify(`Prompt "${toDelete}" deleted`, "info");
 			continue; // back to picker
 		}
 	}
