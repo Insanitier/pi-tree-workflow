@@ -196,7 +196,11 @@ export default function (pi: ExtensionAPI) {
 	let markerId: string | undefined;
 
 	const refreshState = (ctx: ExtensionContext) => {
-		markerId = readState(ctx)?.markerId;
+		// Only read from branch on initial load (session_start), not on
+		// session_tree: after /branch the state entry may be in a sibling
+		// branch and not visible from the current branch path.
+		const stored = readState(ctx)?.markerId;
+		if (stored) markerId = stored;
 	};
 
 	const applyMarker = (
@@ -238,7 +242,7 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx, markerId);
 	});
 	pi.on("session_tree", async (_event, ctx) => {
-		refreshState(ctx);
+		// Don't call refreshState here — see comment above
 		updateStatus(ctx, markerId);
 	});
 	pi.on("turn_end", async (_event, ctx) => {
