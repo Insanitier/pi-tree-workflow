@@ -153,15 +153,13 @@ function applyMarker(
 	nextId: string,
 	msg: string,
 ): void {
-	const prevState = readState(ctx);
-	const prevMarkerId = prevState?.markerId;
-
-	if (
-		prevMarkerId &&
-		prevMarkerId !== nextId &&
-		ctx.sessionManager.getLabel(prevMarkerId) === MARKER_LABEL
-	) {
-		pi.setLabel(prevMarkerId, undefined);
+	// Clear any existing marker labels — scan branch directly instead of
+	// relying on readState, which may be invisible after navigateTree.
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.id === nextId) continue;
+		if (ctx.sessionManager.getLabel(entry.id) === MARKER_LABEL) {
+			pi.setLabel(entry.id, undefined);
+		}
 	}
 
 	let note = "";
@@ -338,7 +336,6 @@ export default function (pi: ExtensionAPI) {
 				markerId,
 				branched: true,
 			} satisfies WorkflowState);
-			pi.setLabel(fresh, "branch");
 
 			ctx.ui.notify("Branch started. Use /end to return to marker.", "info");
 			updateStatus(ctx);
