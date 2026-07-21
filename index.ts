@@ -288,12 +288,13 @@ export default function (pi: ExtensionAPI) {
 			const result = await ctx.navigateTree(fresh, { summarize: false });
 			if (result.cancelled) return;
 
-			// Write branched state at the fresh position
+			// Write branched state + label at the fresh position
 			pi.appendEntry(STATE_ENTRY, {
 				version: 1,
 				markerId,
 				branched: true,
 			} satisfies WorkflowState);
+			pi.setLabel(fresh, "branch");
 
 			ctx.ui.notify("Branch started. Use /end to return to marker.", "info");
 			updateStatus(ctx);
