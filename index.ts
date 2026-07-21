@@ -3,16 +3,10 @@
  *
  * /marker → set checkpoint
  * /branch → jump to fresh context from marker (sub-branch)
- * /end    → compress work back to marker with summary
+ * /end    → pick summary style interactively, compress back to marker
  *
  * Same-branch flow: /marker → work → /end
  * Branch flow:      /marker → /branch → work → /end
- *
- * /end modes:
- *   /end        → default summary prompt (auto-trees style)
- *   /end git    → default + git commit instructions
- *   /end full   → pi's default branch summary prompt
- *   /end <text> → custom focus instructions
  *
  * Usage:
  *   pi -e ./index.ts
@@ -20,8 +14,7 @@
  *   pi install /path/to/pi-tree-workflow
  *
  * State model (supergsd-style): state lives entirely in branch entries.
- * No module-level caching — every handler reads state on demand via
- * readState(ctx). This avoids stale cache across branch navigations.
+ * No module-level caching — every handler reads state on demand.
  */
 
 import type {
@@ -38,19 +31,51 @@ const MARKER_LABEL = "marker";
 const END_WIDGET = "tree-workflow-end";
 const STATUS_KEY = "tree-workflow";
 
-const DEFAULT_END_PROMPT = [
-	"Treat this as a finished work increment that should become durable context for continuing the same repository session.",
-	"Focus on the final accepted outcome, not dead ends or step-by-step implementation noise.",
-	"Capture the concrete code or repo changes, key decisions, important constraints, and any follow-up that still matters.",
-	"Mention relevant files, commands, commits, PR outcomes, or review feedback only when they change future work.",
-	"Omit temporary debugging details, abandoned attempts, and incidental churn that no longer matters.",
-	"Write the summary so a future agent can continue from the repo familiarization and planning context plus this completed increment.",
-].join("\n");
-
-const GIT_END_PROMPT = [
-	DEFAULT_END_PROMPT,
-	"Also explicitly capture the git commit that should be made for the completed changes, including a concise commit subject and any important commit-body notes.",
-].join("\n");
+const END_PROMPTS = [
+	{
+		label: "默认压缩",
+		prompt: [
+			"Treat this as a finished work increment that should become durable context for continuing the same repository session.",
+			"Focus on the final accepted outcome, not dead ends or step-by-step implementation noise.",
+			"Capture the concrete code or repo changes, key decisions, important constraints, and any follow-up that still matters.",
+			"Mention relevant files, commands, commits, PR outcomes, or review feedback only when they change future work.",
+			"Omit temporary debugging details, abandoned attempts, and incidental churn that no longer matters.",
+			"Write the summary so a future agent can continue from the repo familiarization and planning context plus this completed increment.",
+		].join("\n"),
+	},
+	{
+		label: "仅结论",
+		prompt: [
+			"This summary should capture ONLY the final outcome — what changed, what was decided.",
+			"Omit all intermediate steps, attempts, debugging, discussion, and reasoning.",
+			"Format: one paragraph of final result.",
+		].join("\n"),
+	},
+	{
+		label: "详细记录",
+		prompt: [
+			"Write a thorough summary that preserves enough detail for someone who needs to retrace this work.",
+			"Include implementation steps, notable intermediate states, rejected approaches and why they failed, and final decisions with rationale.",
+			"Still omit truly irrelevant churn (typos, trivial build fixes), but keep technical exploration steps.",
+		].join("\n"),
+	},
+	{
+		label: "代码变更",
+		prompt: [
+			"Focus this summary on concrete code changes: files modified, APIs added/changed/removed, new types, test coverage, and migration notes.",
+			"Omit discussion, reasoning, dead ends, and non-code decisions.",
+			"List changed files with a brief description of each change.",
+		].join("\n"),
+	},
+	{
+		label: "决策记录",
+		prompt: [
+			"Focus this summary on architecture decisions, technology choices, tradeoffs considered, and constraints discovered.",
+			"Capture each decision with: context, options considered, chosen approach, and rationale.",
+			"Omit implementation steps, code details, and debugging history.",
+		].join("\n"),
+	},
+];
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -59,12 +84,6 @@ interface WorkflowState {
 	markerId: string;
 	branched?: boolean;
 }
-
-type EndMode =
-	| { mode: "default" }
-	| { mode: "git" }
-	| { mode: "full" }
-	| { mode: "custom"; prompt: string };
 
 // ── State (supergsd-style: on-demand from branch) ────────────────
 
@@ -97,39 +116,6 @@ function getSemanticLeafId(ctx: ExtensionContext): string | undefined {
 		return id;
 	}
 	return undefined;
-}
-
-function parseEndMode(args: string): EndMode {
-	const t = args.trim();
-	if (!t) return { mode: "default" };
-	if (t.toLowerCase() === "git") return { mode: "git" };
-	if (t.toLowerCase() === "full") return { mode: "full" };
-	return { mode: "custom", prompt: t };
-}
-
-function buildEndOptions(mode: EndMode) {
-	switch (mode.mode) {
-		case "full":
-			return { summarize: true as const };
-		case "git":
-			return {
-				summarize: true as const,
-				customInstructions: GIT_END_PROMPT,
-				replaceInstructions: false as const,
-			};
-		case "custom":
-			return {
-				summarize: true as const,
-				customInstructions: mode.prompt,
-				replaceInstructions: false as const,
-			};
-		case "default":
-			return {
-				summarize: true as const,
-				customInstructions: DEFAULT_END_PROMPT,
-				replaceInstructions: false as const,
-			};
-	}
 }
 
 // ── Branch utilities (from supergsd) ────────────────────────────
@@ -193,7 +179,6 @@ function applyMarker(
 	nextId: string,
 	msg: string,
 ): void {
-	// Read prev state from branch to clean up old label
 	const prevState = readState(ctx);
 	const prevMarkerId = prevState?.markerId;
 
@@ -223,12 +208,43 @@ function applyMarker(
 	updateStatus(ctx);
 }
 
+// ── End prompt selection ─────────────────────────────────────────
+
+/**
+ * Resolve summary instructions for /end.
+ *
+ * - args is non-empty → use as custom instructions
+ * - TUI mode → interactive picker
+ * - non-TUI → use default prompt
+ * Returns null if cancelled (picker dismissed).
+ */
+async function resolveEndInstructions(
+	args: string,
+	ctx: ExtensionCommandContext,
+): Promise<string | null> {
+	const trimmed = args.trim();
+	if (trimmed) return trimmed;
+
+	if (!ctx.hasUI) {
+		// Non‑TUI fallback: use default
+		return END_PROMPTS[0].prompt;
+	}
+
+	const choice = await ctx.ui.select(
+		"Summary style:",
+		END_PROMPTS.map((p) => p.label),
+	);
+	if (!choice) return null;
+
+	const found = END_PROMPTS.find((p) => p.label === choice);
+	return found?.prompt ?? END_PROMPTS[0].prompt;
+}
+
 // ── Plugin ───────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	// ── Lifecycle ───────────────────────────────────────────────
 
-	// No cached state — just update UI on every event
 	pi.on("session_start", async (_event, ctx) => updateStatus(ctx));
 	pi.on("session_tree", async (_event, ctx) => updateStatus(ctx));
 	pi.on("turn_end", async (_event, ctx) => updateStatus(ctx));
@@ -305,7 +321,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("end", {
 		description:
-			"Roll up work since marker into a summary and advance the marker",
+			"Summarize work since marker and advance the checkpoint",
 		handler: async (args, ctx) => {
 			const clearFeedback = () => {
 				if (ctx.hasUI) ctx.ui.setWidget(END_WIDGET, undefined);
@@ -335,6 +351,13 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// Resolve summary instructions
+			const instructions = await resolveEndInstructions(args, ctx);
+			if (instructions === null) {
+				// User cancelled the picker
+				return;
+			}
+
 			ctx.ui.setWorkingMessage(
 				ctx.ui.theme.fg("dim", "Summarizing increment…"),
 			);
@@ -348,10 +371,11 @@ export default function (pi: ExtensionAPI) {
 
 			let result: Awaited<ReturnType<typeof ctx.navigateTree>>;
 			try {
-				result = await ctx.navigateTree(
-					markerId,
-					buildEndOptions(parseEndMode(args)),
-				);
+				result = await ctx.navigateTree(markerId, {
+					summarize: true,
+					customInstructions: instructions,
+					replaceInstructions: false,
+				});
 			} finally {
 				clearFeedback();
 			}
