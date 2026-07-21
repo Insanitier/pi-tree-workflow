@@ -1,0 +1,16 @@
+{
+	"name": "pi-tree-workflow",
+	"version": "0.1.0",
+	"description": "/marker, /branch, /end — incremental workflow for pi sessions",
+	"type": "module",
+	"license": "MIT",
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "/Users/insup/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent"
+	}
+}
