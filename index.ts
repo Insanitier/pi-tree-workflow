@@ -18,6 +18,10 @@
  *   pi -e ./index.ts
  *   # or install:
  *   pi install /path/to/pi-tree-workflow
+ *
+ * State model (supergsd-style): state lives entirely in branch entries.
+ * No module-level caching — every handler reads state on demand via
+ * readState(ctx). This avoids stale cache across branch navigations.
  */
 
 import type {
@@ -62,23 +66,25 @@ type EndMode =
 	| { mode: "full" }
 	| { mode: "custom"; prompt: string };
 
-// ── State (from auto-trees) ──────────────────────────────────────
+// ── State (supergsd-style: on-demand from branch) ────────────────
 
-function isWorkflowState(value: unknown): value is WorkflowState {
+function isState(value: unknown): value is WorkflowState {
 	if (typeof value !== "object" || value === null) return false;
 	const c = value as { version?: unknown; markerId?: unknown };
 	return c.version === 1 && typeof c.markerId === "string";
 }
 
+/** Scan branch leaf→root for the latest state entry. */
 function readState(ctx: ExtensionContext): WorkflowState | undefined {
 	let state: WorkflowState | undefined;
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.type !== "custom" || entry.customType !== STATE_ENTRY) continue;
-		if (isWorkflowState(entry.data)) state = entry.data;
+		if (isState(entry.data)) state = entry.data;
 	}
 	return state;
 }
 
+/** Walk up from current leaf to find the first semantic (non-custom, non-label) entry. */
 function getSemanticLeafId(ctx: ExtensionContext): string | undefined {
 	let id = ctx.sessionManager.getLeafId();
 	while (id) {
@@ -128,13 +134,11 @@ function buildEndOptions(mode: EndMode) {
 
 // ── Branch utilities (from supergsd) ────────────────────────────
 
-/** Minimal session interface for findFreshTargetId. */
 interface SessionLike {
 	getLeafId(): string | null;
 	getBranch(): SessionEntry[];
 }
 
-/** Find the first model-visible entry on the current branch (closest to root). */
 function findPreConversationEntry(session: SessionLike): SessionEntry | null {
 	if (!session.getLeafId()) return null;
 	for (const entry of session.getBranch()) {
@@ -150,104 +154,84 @@ function findPreConversationEntry(session: SessionLike): SessionEntry | null {
 	return null;
 }
 
-/**
- * Find the target ID for navigating to a fresh context.
- * Returns the parent of the first model-visible entry, or branch root as fallback.
- */
 function findFreshTargetId(session: SessionLike): string | null {
 	const branch = session.getBranch();
 	if (branch.length === 0) return null;
-
 	const firstVisible = findPreConversationEntry(session);
 	if (firstVisible) return firstVisible.parentId ?? firstVisible.id;
-
 	return branch[0].parentId ?? branch[0].id;
 }
 
-// ── Status ───────────────────────────────────────────────────────
+// ── Status (reads state on-demand) ──────────────────────────────
 
-function updateStatus(
-	ctx: ExtensionContext,
-	markerId: string | undefined,
-): void {
+function updateStatus(ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
 
-	if (!markerId) {
+	const state = readState(ctx);
+	if (!state) {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 		return;
 	}
 
 	const current = getSemanticLeafId(ctx);
-	const state = readState(ctx);
 	const dim = (s: string) => ctx.ui.theme.fg("dim", s);
 
-	if (current === markerId) {
+	if (current === state.markerId) {
 		ctx.ui.setStatus(STATUS_KEY, dim("◎ marker"));
-	} else if (state?.branched) {
+	} else if (state.branched) {
 		ctx.ui.setStatus(STATUS_KEY, dim("↳ branch"));
 	} else {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	}
 }
 
+// ── Label + state writer (shared by /marker and /end) ───────────
+
+function applyMarker(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	nextId: string,
+	msg: string,
+): void {
+	// Read prev state from branch to clean up old label
+	const prevState = readState(ctx);
+	const prevMarkerId = prevState?.markerId;
+
+	if (
+		prevMarkerId &&
+		prevMarkerId !== nextId &&
+		ctx.sessionManager.getLabel(prevMarkerId) === MARKER_LABEL
+	) {
+		pi.setLabel(prevMarkerId, undefined);
+	}
+
+	let note = "";
+	const existing = ctx.sessionManager.getLabel(nextId);
+	if (existing === undefined || existing === MARKER_LABEL) {
+		pi.setLabel(nextId, MARKER_LABEL);
+	} else {
+		note = ` Existing label "${existing}" kept.`;
+	}
+
+	pi.appendEntry(STATE_ENTRY, {
+		version: 1,
+		markerId: nextId,
+		branched: false,
+	} satisfies WorkflowState);
+
+	ctx.ui.notify(`${msg}${note}`, "info");
+	updateStatus(ctx);
+}
+
 // ── Plugin ───────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	let markerId: string | undefined;
-
-	const refreshState = (ctx: ExtensionContext) => {
-		// Only read from branch on initial load (session_start), not on
-		// session_tree: after /branch the state entry may be in a sibling
-		// branch and not visible from the current branch path.
-		const stored = readState(ctx)?.markerId;
-		if (stored) markerId = stored;
-	};
-
-	const applyMarker = (
-		ctx: ExtensionCommandContext,
-		nextId: string,
-		msg: string,
-	): void => {
-		if (
-			markerId &&
-			markerId !== nextId &&
-			ctx.sessionManager.getLabel(markerId) === MARKER_LABEL
-		) {
-			pi.setLabel(markerId, undefined);
-		}
-
-		let note = "";
-		const existing = ctx.sessionManager.getLabel(nextId);
-		if (existing === undefined || existing === MARKER_LABEL) {
-			pi.setLabel(nextId, MARKER_LABEL);
-		} else {
-			note = ` Existing label "${existing}" kept.`;
-		}
-
-		pi.appendEntry(STATE_ENTRY, {
-			version: 1,
-			markerId: nextId,
-			branched: false,
-		} satisfies WorkflowState);
-		markerId = nextId;
-
-		ctx.ui.notify(`${msg}${note}`, "info");
-		updateStatus(ctx, markerId);
-	};
-
 	// ── Lifecycle ───────────────────────────────────────────────
 
-	pi.on("session_start", async (_event, ctx) => {
-		refreshState(ctx);
-		updateStatus(ctx, markerId);
-	});
-	pi.on("session_tree", async (_event, ctx) => {
-		// Don't call refreshState here — see comment above
-		updateStatus(ctx, markerId);
-	});
-	pi.on("turn_end", async (_event, ctx) => {
-		updateStatus(ctx, markerId);
-	});
+	// No cached state — just update UI on every event
+	pi.on("session_start", async (_event, ctx) => updateStatus(ctx));
+	pi.on("session_tree", async (_event, ctx) => updateStatus(ctx));
+	pi.on("turn_end", async (_event, ctx) => updateStatus(ctx));
 
 	// ── /marker ─────────────────────────────────────────────────
 
@@ -261,12 +245,14 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("No conversation point to mark yet", "warning");
 				return;
 			}
-			if (markerId === target) {
+
+			const state = readState(ctx);
+			if (state?.markerId === target) {
 				ctx.ui.notify("Marker already here", "info");
 				return;
 			}
 
-			applyMarker(ctx, target, "Marker set");
+			applyMarker(pi, ctx, target, "Marker set");
 		},
 	});
 
@@ -278,10 +264,13 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			await ctx.waitForIdle();
 
-			if (!markerId) {
+			const state = readState(ctx);
+			if (!state) {
 				ctx.ui.notify("No marker set. Run /marker first", "warning");
 				return;
 			}
+
+			const markerId = state.markerId;
 			if (!ctx.sessionManager.getEntry(markerId)) {
 				ctx.ui.notify(
 					"Stored marker no longer exists. Run /marker again",
@@ -299,7 +288,7 @@ export default function (pi: ExtensionAPI) {
 			const result = await ctx.navigateTree(fresh, { summarize: false });
 			if (result.cancelled) return;
 
-			// Mark branched state so status and /end know we're in a branch
+			// Write branched state at the fresh position
 			pi.appendEntry(STATE_ENTRY, {
 				version: 1,
 				markerId,
@@ -307,7 +296,7 @@ export default function (pi: ExtensionAPI) {
 			} satisfies WorkflowState);
 
 			ctx.ui.notify("Branch started. Use /end to return to marker.", "info");
-			updateStatus(ctx, markerId);
+			updateStatus(ctx);
 		},
 	});
 
@@ -324,10 +313,13 @@ export default function (pi: ExtensionAPI) {
 
 			await ctx.waitForIdle();
 
-			if (!markerId) {
+			const state = readState(ctx);
+			if (!state) {
 				ctx.ui.notify("No marker set. Run /marker first", "warning");
 				return;
 			}
+
+			const markerId = state.markerId;
 			if (!ctx.sessionManager.getEntry(markerId)) {
 				ctx.ui.notify(
 					"Stored marker no longer exists. Run /marker again",
@@ -377,7 +369,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			applyMarker(ctx, next, "Increment summarized and marker advanced");
+			applyMarker(pi, ctx, next, "Increment summarized and marker advanced");
 		},
 	});
 }
