@@ -38,12 +38,15 @@ const STATUS_KEY = "tree-workflow";
 const PROMPTS_FILE = join(homedir(), ".pi", "agent", "tree-workflow-prompts.json");
 
 const DEFAULT_PROMPT = [
-	"Treat this as a finished work increment that should become durable context for continuing the same repository session.",
-	"Focus on the final accepted outcome, not dead ends or step-by-step implementation noise.",
-	"Capture the concrete code or repo changes, key decisions, important constraints, and any follow-up that still matters.",
-	"Mention relevant files, commands, commits, PR outcomes, or review feedback only when they change future work.",
-	"Omit temporary debugging details, abandoned attempts, and incidental churn that no longer matters.",
-	"Write the summary so a future agent can continue from the repo familiarization and planning context plus this completed increment.",
+	"Report the completed work in a structured format:\n",
+	"## Result — Final outcome, what was achieved, key decisions made",
+	"## Output — Concrete code/repo changes, files modified, APIs added/changed/removed",
+	"## Evidence — Key test results, validation, verification evidence",
+	"## Learnings — Ruled-out paths, gotchas, assumptions discovered, reusable lessons",
+	"",
+	"Focus on the final accepted outcome. Omit dead ends, debugging steps, intermediate attempts, and irrelevant churn.",
+	"Capture only what matters for continuing the session: decisions, constraints, and actionable results.",
+	"Write so a future agent can pick up from this increment without retracing the work.",
 ].join("\n");
 
 const ACTION_CREATE = "+ Create prompt";
