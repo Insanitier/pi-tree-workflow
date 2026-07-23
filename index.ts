@@ -39,7 +39,8 @@ const PROMPTS_FILE = join(homedir(), ".pi", "agent", "tree-workflow-prompts.json
 
 const DEFAULT_PROMPT = [
 	"Report the completed work in a structured format:\n",
-	"## Result — Final outcome, what was achieved, key decisions made",
+	"## Goal — What was this increment trying to achieve",
+	"## Result — Final outcome, what was accomplished, key decisions made",
 	"## Output — Concrete code/repo changes, files modified, APIs added/changed/removed",
 	"## Evidence — Key test results, validation, verification evidence",
 	"## Learnings — Ruled-out paths, gotchas, assumptions discovered, reusable lessons",
