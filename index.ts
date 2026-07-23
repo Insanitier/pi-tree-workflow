@@ -395,7 +395,7 @@ export default function (pi: ExtensionAPI) {
 				result = await ctx.navigateTree(markerId, {
 					summarize: true,
 					customInstructions: instructions,
-					replaceInstructions: false,
+					replaceInstructions: true,
 				});
 			} finally {
 				clearFeedback();
