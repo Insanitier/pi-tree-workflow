@@ -21,7 +21,6 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionCommandContext,
-	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
@@ -83,48 +82,17 @@ function readState(ctx: ExtensionContext): WorkflowState | undefined {
 }
 
 function getSemanticLeafId(ctx: ExtensionContext): string | undefined {
-	let id = ctx.sessionManager.getLeafId();
-	while (id) {
-		const entry = ctx.sessionManager.getEntry(id);
-		if (!entry) return undefined;
-		if (entry.type === "custom" || entry.type === "label") {
-			id = entry.parentId;
-			continue;
-		}
-		return id;
+	const id = ctx.sessionManager.getLeafId();
+	if (!id) return undefined;
+	const entry = ctx.sessionManager.getEntry(id);
+	if (!entry) return undefined;
+	if (entry.type === "custom" || entry.type === "label") {
+		return entry.parentId ?? undefined;
 	}
-	return undefined;
+	return id;
 }
 
-// ── Branch utilities (from supergsd) ────────────────────────────
-
-interface SessionLike {
-	getLeafId(): string | null;
-	getBranch(): SessionEntry[];
-}
-
-function findPreConversationEntry(session: SessionLike): SessionEntry | null {
-	if (!session.getLeafId()) return null;
-	for (const entry of session.getBranch()) {
-		if (
-			entry.type === "message" ||
-			entry.type === "compaction" ||
-			entry.type === "branch_summary" ||
-			entry.type === "custom_message"
-		) {
-			return entry;
-		}
-	}
-	return null;
-}
-
-function findFreshTargetId(session: SessionLike): string | null {
-	const branch = session.getBranch();
-	if (branch.length === 0) return null;
-	const firstVisible = findPreConversationEntry(session);
-	if (firstVisible) return firstVisible.parentId ?? firstVisible.id;
-	return branch[0].parentId ?? branch[0].id;
-}
+// ── Branch utilities ───────────────────────────────────────────
 
 // ── Status ──────────────────────────────────────────────────────
 
@@ -178,13 +146,7 @@ function applyMarker(
 		}
 	}
 
-	let note = "";
-	const existing = ctx.sessionManager.getLabel(nextId);
-	if (existing === undefined || existing === MARKER_LABEL) {
-		pi.setLabel(nextId, MARKER_LABEL);
-	} else {
-		note = ` Existing label "${existing}" kept.`;
-	}
+	pi.setLabel(nextId, MARKER_LABEL);
 
 	pi.appendEntry(STATE_ENTRY, {
 		version: 1,
@@ -193,7 +155,7 @@ function applyMarker(
 	} satisfies WorkflowState);
 	lastMarkerLabelTarget = nextId;
 
-	ctx.ui.notify(`${msg}${note}`, "info");
+	ctx.ui.notify(msg, "info");
 	updateStatus(ctx);
 }
 
@@ -343,7 +305,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const fresh = findFreshTargetId(ctx.sessionManager);
+			const branchEntries = ctx.sessionManager.getBranch();
+			const fresh = branchEntries.length > 0
+				? (branchEntries[0].parentId ?? branchEntries[0].id)
+				: undefined;
 			if (!fresh) {
 				ctx.ui.notify("No fresh context point found", "warning");
 				return;
@@ -369,11 +334,6 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Summarize work since marker and advance the checkpoint",
 		handler: async (_args, ctx) => {
-			const clearFeedback = () => {
-				if (ctx.hasUI) ctx.ui.setWidget(END_WIDGET, undefined);
-				ctx.ui.setWorkingMessage();
-			};
-
 			await ctx.waitForIdle();
 
 			const state = readState(ctx);
@@ -419,7 +379,8 @@ export default function (pi: ExtensionAPI) {
 					replaceInstructions: true,
 				});
 			} finally {
-				clearFeedback();
+				if (ctx.hasUI) ctx.ui.setWidget(END_WIDGET, undefined);
+				ctx.ui.setWorkingMessage();
 			}
 
 			if (result.cancelled) {
