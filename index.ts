@@ -151,14 +151,26 @@ function updateStatus(ctx: ExtensionContext): void {
 
 // ── Label + state writer ───────────────────────────────────────
 
+// Track the last entry we gave the "marker" label so we can clean it up
+// even when the old marker sits on a sibling branch not visible from
+// the current branch path.
+let lastMarkerLabelTarget: string | undefined;
+
 function applyMarker(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	nextId: string,
 	msg: string,
 ): void {
-	// Clear any existing marker labels — scan branch directly instead of
-	// relying on readState, which may be invisible after navigateTree.
+	// Clear previous marker label (works across sibling branches)
+	if (
+		lastMarkerLabelTarget &&
+		lastMarkerLabelTarget !== nextId &&
+		ctx.sessionManager.getLabel(lastMarkerLabelTarget) === MARKER_LABEL
+	) {
+		pi.setLabel(lastMarkerLabelTarget, undefined);
+	}
+	// Also scan current branch for any orphaned marker labels
 	for (const entry of ctx.sessionManager.getBranch()) {
 		if (entry.id === nextId) continue;
 		if (ctx.sessionManager.getLabel(entry.id) === MARKER_LABEL) {
@@ -179,6 +191,7 @@ function applyMarker(
 		markerId: nextId,
 		branched: false,
 	} satisfies WorkflowState);
+	lastMarkerLabelTarget = nextId;
 
 	ctx.ui.notify(`${msg}${note}`, "info");
 	updateStatus(ctx);
@@ -276,7 +289,11 @@ async function resolveEndInstructions(
 export default function (pi: ExtensionAPI) {
 	// ── Lifecycle ───────────────────────────────────────────────
 
-	pi.on("session_start", async (_event, ctx) => updateStatus(ctx));
+	pi.on("session_start", async (_event, ctx) => {
+		const state = readState(ctx);
+		if (state) lastMarkerLabelTarget = state.markerId;
+		updateStatus(ctx);
+	});
 	pi.on("session_tree", async (_event, ctx) => updateStatus(ctx));
 	pi.on("turn_end", async (_event, ctx) => updateStatus(ctx));
 
