@@ -82,14 +82,17 @@ function readState(ctx: ExtensionContext): WorkflowState | undefined {
 }
 
 function getSemanticLeafId(ctx: ExtensionContext): string | undefined {
-	const id = ctx.sessionManager.getLeafId();
-	if (!id) return undefined;
-	const entry = ctx.sessionManager.getEntry(id);
-	if (!entry) return undefined;
-	if (entry.type === "custom" || entry.type === "label") {
-		return entry.parentId ?? undefined;
+	let id = ctx.sessionManager.getLeafId();
+	while (id) {
+		const entry = ctx.sessionManager.getEntry(id);
+		if (!entry) return undefined;
+		if (entry.type === "custom" || entry.type === "label") {
+			id = entry.parentId;
+			continue;
+		}
+		return id;
 	}
-	return id;
+	return undefined;
 }
 
 // ── Branch utilities ───────────────────────────────────────────
