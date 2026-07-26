@@ -16,7 +16,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -46,6 +46,7 @@ const ACTION_JUMP = "Jump";
 const ACTION_SUMMARIZE = "Summarize & Jump";
 const ACTION_DELETE = "Delete";
 const ACTION_BACK = "← Back";
+const SEPARATOR = "──────────────";
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -86,11 +87,15 @@ function readMarkers(ctx: ExtensionContext): MarkerData[] {
 
 /** Compute the next available name when `base` already exists. */
 function dedupName(base: string, existing: MarkerData[]): string {
+	// ponytail: sanitization is minimal — marker names are internal, not user-facing URLs
+	const clean = base.trim().replace(/[^a-zA-Z0-9\-_]/g, "-");
+	if (!clean) return `marker-${Date.now()}`;
+
 	const taken = new Set(existing.map((m) => m.name));
-	if (!taken.has(base)) return base;
+	if (!taken.has(clean)) return clean;
 	let n = 2;
-	while (taken.has(`${base}-${n}`)) n++;
-	return `${base}-${n}`;
+	while (taken.has(`${clean}-${n}`)) n++;
+	return `${clean}-${n}`;
 }
 
 // ── Status ──────────────────────────────────────────────────────
@@ -124,7 +129,7 @@ function loadPrompts(): PromptsStore {
 
 function savePrompts(store: PromptsStore): void {
 	const dir = join(homedir(), ".pi", "agent");
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	mkdirSync(dir, { recursive: true }); // idempotent with recursive: true
 	writeFileSync(PROMPTS_FILE, JSON.stringify(store, null, 2), "utf-8");
 }
 
@@ -142,7 +147,7 @@ async function resolveEndInstructions(
 	while (true) {
 		const items: string[] = ["Default"];
 		if (customNames.length > 0) items.push(...customNames);
-		if (customNames.length > 0) items.push("──────────────");
+		if (customNames.length > 0) items.push(SEPARATOR);
 		items.push(ACTION_CREATE);
 		if (customNames.length > 0) items.push(ACTION_PROMPT_DELETE);
 
@@ -187,6 +192,31 @@ async function resolveEndInstructions(
 	}
 }
 
+// ── Widget helper ──────────────────────────────────────────────
+
+/** Run `fn` with a widget shown, cleaning up in `finally`. */
+async function withWidget<T>(
+	ctx: ExtensionCommandContext,
+	widgetId: string,
+	message: string,
+	fn: () => Promise<T>,
+): Promise<T> {
+	ctx.ui.setWorkingMessage(ctx.ui.theme.fg("dim", message));
+	if (ctx.hasUI) {
+		ctx.ui.setWidget(
+			widgetId,
+			[ctx.ui.theme.fg("dim", message)],
+			{ placement: "aboveEditor" },
+		);
+	}
+	try {
+		return await fn();
+	} finally {
+		if (ctx.hasUI) ctx.ui.setWidget(widgetId, undefined);
+		ctx.ui.setWorkingMessage();
+	}
+}
+
 // ── Semantic ID ─────────────────────────────────────────────────
 
 function getSemanticLeafId(ctx: ExtensionContext): string | undefined {
@@ -214,7 +244,7 @@ async function markerTUI(
 
 	// ── Level 1: pick a marker or create one ────────────────────
 	const items: string[] = [...names];
-	if (names.length > 0) items.push("──────────────");
+	if (names.length > 0) items.push(SEPARATOR);
 	items.push(ACTION_SET);
 
 	const picked = await ctx.ui.select("Markers:", items);
@@ -236,7 +266,7 @@ async function markerTUI(
 
 	// ── Level 2: action on selected marker ──────────────────────
 	const actions: string[] = [ACTION_JUMP, ACTION_SUMMARIZE, ACTION_DELETE];
-	actions.push("──────────────", ACTION_BACK);
+	actions.push(SEPARATOR, ACTION_BACK);
 
 	const action = await ctx.ui.select(picked, actions);
 	if (!action || action === ACTION_BACK) return;
@@ -253,7 +283,7 @@ async function markerTUI(
 	}
 
 	if (action === ACTION_SUMMARIZE) {
-		await summarizeToMarker(pi, ctx, marker);
+		await summarizeToMarker(ctx, marker);
 		return;
 	}
 }
@@ -293,7 +323,6 @@ async function jumpToMarker(
 }
 
 async function summarizeToMarker(
-	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	marker: MarkerData,
 ): Promise<void> {
@@ -311,26 +340,13 @@ async function summarizeToMarker(
 		return;
 	}
 
-	ctx.ui.setWorkingMessage(ctx.ui.theme.fg("dim", "Summarizing increment…"));
-	if (ctx.hasUI) {
-		ctx.ui.setWidget(
-			END_WIDGET,
-			[ctx.ui.theme.fg("dim", `Summarizing back to "${marker.name}"…`)],
-			{ placement: "aboveEditor" },
-		);
-	}
-
-	let result: Awaited<ReturnType<typeof ctx.navigateTree>>;
-	try {
-		result = await ctx.navigateTree(marker.targetId, {
+	const result = await withWidget(ctx, END_WIDGET, `Summarizing back to "${marker.name}"…`, async () => {
+		return await ctx.navigateTree(marker.targetId, {
 			summarize: true,
 			customInstructions: instructions,
 			replaceInstructions: true,
 		});
-	} finally {
-		if (ctx.hasUI) ctx.ui.setWidget(END_WIDGET, undefined);
-		ctx.ui.setWorkingMessage();
-	}
+	});
 
 	if (result.cancelled) {
 		ctx.ui.notify("Summarize cancelled", "warning");
@@ -373,12 +389,7 @@ export default function (pi: ExtensionAPI) {
 			await ctx.waitForIdle();
 
 			const name = args.trim();
-			if (name) {
-				await createMarker(pi, ctx, name);
-				return;
-			}
-
-			await markerTUI(pi, ctx);
+			return name ? createMarker(pi, ctx, name) : markerTUI(pi, ctx);
 		},
 	});
 }
