@@ -30,6 +30,7 @@ import { join } from "path";
 // ── Constants ─────────────────────────────────────────────────────
 
 const STATE_ENTRY = "tree-workflow-state";
+const MARKER_ENTRY = "tree-workflow-marker";
 const MARKER_LABEL = "marker";
 const END_WIDGET = "tree-workflow-end";
 const STATUS_KEY = "tree-workflow";
@@ -58,6 +59,11 @@ interface WorkflowState {
 	version: 1;
 	markerId: string;
 	branched?: boolean;
+}
+
+interface MarkerData {
+	name: string;
+	targetId: string;
 }
 
 interface PromptsStore {
@@ -95,7 +101,37 @@ function getSemanticLeafId(ctx: ExtensionContext): string | undefined {
 	return undefined;
 }
 
-// ── Branch utilities ───────────────────────────────────────────
+// ── Marker utilities ────────────────────────────────────────────
+
+function isMarkerEntry(
+	entry: unknown,
+): entry is { id: string; data: MarkerData } {
+	if (typeof entry !== "object" || entry === null) return false;
+	const e = entry as { type?: unknown; customType?: unknown; data?: unknown };
+	if (e.type !== "custom" || e.customType !== MARKER_ENTRY) return false;
+	const d = e.data as { name?: unknown; targetId?: unknown } | undefined;
+	return !!d && typeof d.name === "string" && typeof d.targetId === "string";
+}
+
+function readMarkers(ctx: ExtensionContext): MarkerData[] {
+	const markers: MarkerData[] = [];
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (isMarkerEntry(entry)) markers.push(entry.data);
+	}
+	return markers;
+}
+
+function nextMarkerName(markers: MarkerData[]): string {
+	let max = 0;
+	for (const m of markers) {
+		const match = m.name.match(/^Marker (\d+)$/);
+		if (match) {
+			const n = parseInt(match[1], 10);
+			if (n > max) max = n;
+		}
+	}
+	return `Marker ${max + 1}`;
+}
 
 // ── Status ──────────────────────────────────────────────────────
 
@@ -122,45 +158,9 @@ function updateStatus(ctx: ExtensionContext): void {
 
 // ── Label + state writer ───────────────────────────────────────
 
-// Track the last entry we gave the "marker" label so we can clean it up
-// even when the old marker sits on a sibling branch not visible from
-// the current branch path.
+// Track the last entry we gave the marker label so we can restore
+// across sessions even when the state entry is deep in the tree.
 let lastMarkerLabelTarget: string | undefined;
-
-function applyMarker(
-	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
-	nextId: string,
-	msg: string,
-): void {
-	// Clear previous marker label (works across sibling branches)
-	if (
-		lastMarkerLabelTarget &&
-		lastMarkerLabelTarget !== nextId &&
-		ctx.sessionManager.getLabel(lastMarkerLabelTarget) === MARKER_LABEL
-	) {
-		pi.setLabel(lastMarkerLabelTarget, undefined);
-	}
-	// Also scan current branch for any orphaned marker labels
-	for (const entry of ctx.sessionManager.getBranch()) {
-		if (entry.id === nextId) continue;
-		if (ctx.sessionManager.getLabel(entry.id) === MARKER_LABEL) {
-			pi.setLabel(entry.id, undefined);
-		}
-	}
-
-	pi.setLabel(nextId, MARKER_LABEL);
-
-	pi.appendEntry(STATE_ENTRY, {
-		version: 1,
-		markerId: nextId,
-		branched: false,
-	} satisfies WorkflowState);
-	lastMarkerLabelTarget = nextId;
-
-	ctx.ui.notify(msg, "info");
-	updateStatus(ctx);
-}
 
 // ── Prompt persistence ─────────────────────────────────────────
 
@@ -265,7 +265,7 @@ export default function (pi: ExtensionAPI) {
 	// ── /marker ─────────────────────────────────────────────────
 
 	pi.registerCommand("marker", {
-		description: "Mark current conversation point as checkpoint",
+		description: "Mark current conversation point as named checkpoint",
 		handler: async (_args, ctx) => {
 			await ctx.waitForIdle();
 
@@ -275,13 +275,87 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const state = readState(ctx);
-			if (state?.markerId === target) {
+			const markers = readMarkers(ctx);
+			if (markers.some((m) => m.targetId === target)) {
 				ctx.ui.notify("Marker already here", "info");
 				return;
 			}
 
-			applyMarker(pi, ctx, target, "Marker set");
+			const name = nextMarkerName(markers);
+
+			pi.setLabel(target, name);
+			pi.appendEntry(MARKER_ENTRY, {
+				name,
+				targetId: target,
+			} satisfies MarkerData);
+			// State entry for /end and /branch backward compat
+			pi.appendEntry(STATE_ENTRY, {
+				version: 1,
+				markerId: target,
+				branched: false,
+			} satisfies WorkflowState);
+			lastMarkerLabelTarget = target;
+
+			ctx.ui.notify(`"${name}" set`, "info");
+			updateStatus(ctx);
+		},
+	});
+
+	// ── /list-markers ──────────────────────────────────────────
+
+	pi.registerCommand("list-markers", {
+		description: "List all saved markers",
+		handler: async (_args, ctx) => {
+			const markers = readMarkers(ctx);
+			if (markers.length === 0) {
+				ctx.ui.notify("No markers set", "info");
+				return;
+			}
+
+			const text = markers
+				.map((m) => `${m.name}`)
+				.join("\n");
+
+			if (ctx.hasUI) {
+				ctx.ui.editor("Markers", text);
+			} else {
+				ctx.ui.notify(`Markers: ${text}`, "info");
+			}
+		},
+	});
+
+	// ── /jump-marker ───────────────────────────────────────────
+
+	pi.registerCommand("jump-marker", {
+		description: "Jump to a marker by number",
+		handler: async (args, ctx) => {
+			await ctx.waitForIdle();
+
+			const num = args?.trim();
+			if (!num || !/^\d+$/.test(num)) {
+				ctx.ui.notify("Usage: /jump-marker <n>", "warning");
+				return;
+			}
+
+			const markers = readMarkers(ctx);
+			const name = `Marker ${num}`;
+			const marker = markers.find((m) => m.name === name);
+			if (!marker) {
+				ctx.ui.notify(`"${name}" not found`, "warning");
+				return;
+			}
+
+			if (!ctx.sessionManager.getEntry(marker.targetId)) {
+				ctx.ui.notify(`"${name}" target no longer exists`, "warning");
+				return;
+			}
+
+			const result = await ctx.navigateTree(marker.targetId, {
+				summarize: false,
+			});
+			if (result.cancelled) return;
+
+			ctx.ui.notify(`Jumped to "${name}"`, "info");
 		},
 	});
 
@@ -400,7 +474,17 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			applyMarker(pi, ctx, next, "Increment summarized and marker advanced");
+			// Set marker at destination (no named entry — avoids clutter)
+			pi.setLabel(next, MARKER_LABEL);
+			pi.appendEntry(STATE_ENTRY, {
+				version: 1,
+				markerId: next,
+				branched: false,
+			} satisfies WorkflowState);
+			lastMarkerLabelTarget = next;
+
+			ctx.ui.notify("Increment summarized, marker advanced", "info");
+			updateStatus(ctx);
 		},
 	});
 }
