@@ -61,28 +61,33 @@ interface PromptsStore {
 
 // ── Marker utilities ────────────────────────────────────────────
 
-/** Read all active markers from branch, newest first (per name). */
+/** Read all active markers, in creation order (per name). */
 function readMarkers(ctx: ExtensionContext): MarkerData[] {
-	const branch = ctx.sessionManager.getBranch();
-	const result: MarkerData[] = [];
-	const seen = new Set<string>();
+	// Scan ALL entries, not just the current branch path: markers are
+	// bookmarks and must survive branch switches (jump/summarize moves
+	// the leaf, abandoning the entries that held the marker).
+	const byName = new Map<string, MarkerData & { deleted: boolean; ts: number }>();
 
-	// Walk leaf→root: latest entry per name wins; tombstone excludes name.
-	for (let i = branch.length - 1; i >= 0; i--) {
-		const e = branch[i];
+	for (const e of ctx.sessionManager.getEntries()) {
 		if (e.type !== "custom" || e.customType !== MARKER_ENTRY) continue;
 		const d = e.data as { name?: unknown; targetId?: unknown; deleted?: boolean };
 		if (typeof d.name !== "string" || typeof d.targetId !== "string") continue;
-		if (seen.has(d.name)) continue; // already resolved
 
-		seen.add(d.name);
-		if (!d.deleted) {
-			result.push({ name: d.name, targetId: d.targetId });
-		}
-		// If deleted → don't push, name excluded from live set
+		const ts = Date.parse(e.timestamp);
+		const prev = byName.get(d.name);
+		// Latest entry per name wins — a later tombstone shadows the marker.
+		if (prev && ts < prev.ts) continue;
+		byName.set(d.name, {
+			name: d.name,
+			targetId: d.targetId,
+			deleted: !!d.deleted,
+			ts,
+		});
 	}
 
-	return result.reverse();
+	return [...byName.values()]
+		.filter((m) => !m.deleted)
+		.map(({ name, targetId }) => ({ name, targetId }));
 }
 
 /** Compute the next available name when `base` already exists. */
